@@ -19,6 +19,7 @@ package batcher
 import (
 	"context"
 	"fmt"
+	"github.com/offchainlabs/arbitrum/packages/arb-util/broadcaster"
 	"math/big"
 	"time"
 
@@ -48,6 +49,8 @@ type SequencerBatcher struct {
 	auth                       *ethbridge.TransactAuth
 	chainTimeCheckInterval     time.Duration
 	logBatchGasCosts           bool
+	feedBroadcaster            *broadcaster.Broadcaster
+	dataSigner                 func([]byte) ([]byte, error)
 
 	sequencer       common.Address
 	txQueue         chan *types.Transaction
@@ -67,7 +70,16 @@ func getChainTime(ctx context.Context, client ethutils.EthClient) (inbox.ChainTi
 	return chainTime, nil
 }
 
-func NewSequencerBatcher(ctx context.Context, db core.ArbCore, inboxReader *monitor.InboxReader, client ethutils.EthClient, delayedMessagesTargetDelay *big.Int, sequencerInbox *ethbridgecontracts.SequencerInbox, auth *bind.TransactOpts) (*SequencerBatcher, error) {
+func NewSequencerBatcher(
+	ctx context.Context,
+	db core.ArbCore,
+	inboxReader *monitor.InboxReader,
+	client ethutils.EthClient,
+	delayedMessagesTargetDelay *big.Int,
+	sequencerInbox *ethbridgecontracts.SequencerInbox,
+	auth *bind.TransactOpts,
+	dataSigner func([]byte) ([]byte, error),
+) (*SequencerBatcher, error) {
 	chainTime, err := getChainTime(ctx, client)
 	if err != nil {
 		return nil, err
@@ -86,6 +98,19 @@ func NewSequencerBatcher(ctx context.Context, db core.ArbCore, inboxReader *moni
 		return nil, err
 	}
 
+	broadcasterSettings := broadcaster.Settings{
+		Addr:      ":9642",
+		Workers:   128,
+		Queue:     1,
+		IoTimeout: 2 * time.Second,
+	}
+	feedBroadcaster := broadcaster.NewBroadcaster(broadcasterSettings)
+	err = feedBroadcaster.Start()
+	if err != nil {
+		logger.Warn().Err(err).Msg("error starting feed broadcaster")
+		return nil, err
+	}
+
 	return &SequencerBatcher{
 		db:                         db,
 		inboxReader:                inboxReader,
@@ -94,6 +119,8 @@ func NewSequencerBatcher(ctx context.Context, db core.ArbCore, inboxReader *moni
 		sequencerInbox:             sequencerInbox,
 		auth:                       transactAuth,
 		chainTimeCheckInterval:     time.Second,
+		feedBroadcaster:            feedBroadcaster,
+		dataSigner:                 dataSigner,
 
 		sequencer:       common.NewAddressFromEth(sequencer),
 		txQueue:         make(chan *types.Transaction, 10),
@@ -142,6 +169,9 @@ func (b *SequencerBatcher) SendTransaction(ctx context.Context, startTx *types.T
 		}
 	}
 	totalDelayedCount, err := b.db.GetTotalDelayedMessagesSequenced()
+	if err != nil {
+		return err
+	}
 	if totalDelayedCount.Cmp(big.NewInt(0)) == 0 {
 		return errors.New("chain not yet initialized")
 	}
@@ -171,6 +201,15 @@ func (b *SequencerBatcher) SendTransaction(ctx context.Context, startTx *types.T
 	}
 	if !success {
 		return errors.New("failed to deliver messages")
+	}
+
+	signature, err := b.dataSigner(txBatchItem.Accumulator.Bytes())
+	if err != nil {
+		return err
+	}
+	err = b.feedBroadcaster.Broadcast(new(big.Int).SetBytes(prevAcc.Bytes()), seqBatchItems[0].ToBytesWithSeqNum(), new(big.Int).SetBytes(signature))
+	if err != nil {
+		return err
 	}
 
 	// TODO check if transaction was valid and if not roll it back
@@ -371,6 +410,8 @@ func (b *SequencerBatcher) createBatch(ctx context.Context, newMsgCount *big.Int
 }
 
 func (b *SequencerBatcher) Start(ctx context.Context) {
+	defer b.feedBroadcaster.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
