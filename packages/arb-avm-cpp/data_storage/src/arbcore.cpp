@@ -50,7 +50,7 @@ constexpr auto sideload_cache_size = 20;
 
 ArbCore::ArbCore(std::shared_ptr<DataStorage> data_storage_)
     : data_storage(std::move(data_storage_)),
-      code(std::make_shared<Code>(getNextSegmentID(data_storage))) {
+      core_code(std::make_shared<Code>(getNextSegmentID(data_storage))) {
     if (logs_cursors.size() > 255) {
         throw std::runtime_error("Too many logscursors");
     }
@@ -153,11 +153,11 @@ rocksdb::Status ArbCore::initialize(const LoadedExecutable& executable) {
         return status;
     }
 
-    code->addSegment(executable.code);
-    machine = std::make_unique<MachineThread>(
-        MachineState{code, executable.static_val});
+    core_code->addSegment(executable.code);
+    core_machine = std::make_unique<MachineThread>(
+        MachineState{core_code, executable.static_val});
 
-    last_machine = std::make_unique<Machine>(*machine);
+    last_machine = std::make_unique<Machine>(*core_machine);
 
     ReadWriteTransaction tx(data_storage);
     // Need to initialize database from scratch
@@ -250,7 +250,7 @@ rocksdb::Status ArbCore::triggerSaveCheckpoint() {
 }
 
 rocksdb::Status ArbCore::saveCheckpoint(ReadWriteTransaction& tx) {
-    auto& state = machine->machine_state;
+    auto& state = core_machine->machine_state;
     if (!isValid(tx, state.output.fully_processed_inbox)) {
         std::cerr << "Attempted to save invalid checkpoint at gas "
                   << state.output.arb_gas_used << std::endl;
@@ -258,7 +258,7 @@ rocksdb::Status ArbCore::saveCheckpoint(ReadWriteTransaction& tx) {
         return rocksdb::Status::OK();
     }
 
-    auto status = saveMachineState(tx, *machine);
+    auto status = saveMachineState(tx, *core_machine);
     if (!status.ok()) {
         return status;
     }
@@ -464,16 +464,16 @@ rocksdb::Status ArbCore::reorgToMessageCountOrBefore(
 
     // Machine was executing obsolete messages so restore machine
     // from last checkpoint
-    if (machine != nullptr) {
-        machine->abortMachine();
+    if (core_machine != nullptr) {
+        core_machine->abortMachine();
     }
 
-    machine = std::move(new_machine);
+    core_machine = std::move(new_machine);
 
     // Update last machine
     {
         std::unique_lock<std::shared_mutex> guard(last_machine_mutex);
-        last_machine = std::make_unique<Machine>(*machine);
+        last_machine = std::make_unique<Machine>(*core_machine);
     }
 
     return tx.commit();
@@ -600,19 +600,19 @@ std::unique_ptr<T> ArbCore::getMachineUsingStateKeys(
         loaded_segment = false;
         std::set<uint64_t> next_segment_ids;
         for (auto it = segment_ids.rbegin(); it != segment_ids.rend(); ++it) {
-            if (code->containsSegment(*it)) {
+            if (core_code->containsSegment(*it)) {
                 // If the segment is already loaded, no need to restore it
                 continue;
             }
             auto segment =
                 getCodeSegment(transaction, *it, next_segment_ids, value_cache);
-            code->restoreExistingSegment(std::move(segment));
+            core_code->restoreExistingSegment(std::move(segment));
             loaded_segment = true;
         }
         segment_ids = std::move(next_segment_ids);
     };
     auto state = MachineState{
-        code,
+        core_code,
         std::move(std::get<CountedData<value>>(register_results).data),
         std::move(std::get<CountedData<value>>(static_results).data),
         Datastack(
@@ -658,7 +658,7 @@ void ArbCore::operator()() {
         bool isMachineValid;
         {
             ReadTransaction tx(data_storage);
-            isMachineValid = isValid(tx, machine->getReorgData());
+            isMachineValid = isValid(tx, core_machine->getReorgData());
         }
         if (!isMachineValid) {
             std::cerr
@@ -695,38 +695,40 @@ void ArbCore::operator()() {
         }
 
         // Check machine thread
-        if (machine->status() == MachineThread::MACHINE_ERROR) {
-            core_error_string = machine->getErrorString();
+        if (core_machine->status() == MachineThread::MACHINE_ERROR) {
+            core_error_string = core_machine->getErrorString();
             std::cerr << "AVM machine stopped with error: " << core_error_string
                       << "\n";
             break;
         }
 
-        if (machine->status() == MachineThread::MACHINE_SUCCESS) {
+        if (core_machine->status() == MachineThread::MACHINE_SUCCESS) {
             ReadWriteTransaction tx(data_storage);
 
-            auto last_assertion = machine->nextAssertion();
+            auto last_assertion = core_machine->nextAssertion();
 
             // Save last machine output
             {
                 std::unique_lock<std::shared_mutex> guard(last_machine_mutex);
-                last_machine = std::make_unique<Machine>(*machine);
+                last_machine = std::make_unique<Machine>(*core_machine);
             }
 
-            if (machine->machine_state.output.arb_gas_used >
+            if (core_machine->machine_state.output.arb_gas_used >
                 last_old_machine_cache_gas + old_machine_cache_interval) {
                 std::unique_lock<std::shared_mutex> guard(
                     old_machine_cache_mutex);
                 if (old_machine_cache.size() > old_machine_cache_max_size) {
                     old_machine_cache.erase(old_machine_cache.begin());
                 }
-                old_machine_cache[machine->machine_state.output.arb_gas_used] =
-                    std::make_unique<Machine>(*machine);
+                old_machine_cache[core_machine->machine_state.output
+                                      .arb_gas_used] =
+                    std::make_unique<Machine>(*core_machine);
             }
 
             // Save logs and sends
-            auto status = saveAssertion(
-                tx, last_assertion, machine->machine_state.output.arb_gas_used);
+            auto status =
+                saveAssertion(tx, last_assertion,
+                              core_machine->machine_state.output.arb_gas_used);
             if (!status.ok()) {
                 core_error_string = status.ToString();
                 std::cerr << "ArbCore assertion saving failed: "
@@ -740,7 +742,8 @@ void ArbCore::operator()() {
                     auto block = *last_assertion.sideloadBlockNumber;
                     std::unique_lock<std::shared_mutex> lock(
                         sideload_cache_mutex);
-                    sideload_cache[block] = std::make_unique<Machine>(*machine);
+                    sideload_cache[block] =
+                        std::make_unique<Machine>(*core_machine);
                     // Remove any sideload_cache entries that are either more
                     // than sideload_cache_size blocks old, or in the future
                     // (meaning they've been reorg'd out).
@@ -772,7 +775,7 @@ void ArbCore::operator()() {
 
                 // Machine was stopped to save sideload, update execConfig
                 // and start machine back up where it stopped
-                auto machine_success = machine->continueRunningMachine();
+                auto machine_success = core_machine->continueRunningMachine();
                 if (!machine_success) {
                     core_error_string = "Error starting machine thread";
                     machine_error = true;
@@ -791,16 +794,16 @@ void ArbCore::operator()() {
             }
         }
 
-        if (machine->status() == MachineThread::MACHINE_ABORTED) {
+        if (core_machine->status() == MachineThread::MACHINE_ABORTED) {
             // Just reset status so machine can be restarted
-            machine->clearError();
+            core_machine->clearError();
         }
 
-        if (machine->status() == MachineThread::MACHINE_NONE) {
+        if (core_machine->status() == MachineThread::MACHINE_NONE) {
             // Start execution of machine if new message available
             ReadSnapshotTransaction tx(data_storage);
             auto messages_result = readNextMessages(
-                tx, machine->machine_state.output.fully_processed_inbox,
+                tx, core_machine->machine_state.output.fully_processed_inbox,
                 max_message_batch_size);
             if (!messages_result.status.ok()) {
                 core_error_string = messages_result.status.ToString();
@@ -813,7 +816,7 @@ void ArbCore::operator()() {
             if (!messages_result.data.empty()) {
                 execConfig.inbox_messages = messages_result.data;
 
-                auto success = machine->runMachine(execConfig);
+                auto success = core_machine->runMachine(execConfig);
                 if (!success) {
                     core_error_string = "Error starting machine thread";
                     machine_error = true;
@@ -861,7 +864,7 @@ void ArbCore::operator()() {
     std::cerr << "Exiting main ArbCore thread" << std::endl;
 
     // Error occurred, make sure machine stops cleanly
-    machine->abortMachine();
+    core_machine->abortMachine();
 }
 
 rocksdb::Status ArbCore::saveLogs(ReadWriteTransaction& tx,
