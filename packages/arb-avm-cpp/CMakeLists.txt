@@ -56,7 +56,6 @@ set(AVM_VERSION_STRING ${AVM_VERSION_MAJOR}.${AVM_VERSION_MINOR}.${AVM_VERSION_P
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR}/cmake)
 
-SET(FAB "po" CACHE STRING "Some user-specified option")
 option(ENABLE_JEMALLOC "Enable jemalloc" OFF)
 option(AVM_BUILD_TESTING "Build tests" ON)
 
